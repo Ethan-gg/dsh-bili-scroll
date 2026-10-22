@@ -25,14 +25,11 @@ const defineTool = hostDeps.defineTool
 import { spawn } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { McpClient } from './lib/mcp.mjs'
 import { verifyRecent, appendVerifyToReport } from './lib/verify.mjs'
 import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey } from './lib/state.mjs'
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
-import { resolveUid } from './lib/uid.mjs'
-import { loadCred as dmCred, listSessions as dmList, fetchMsgs as dmFetch } from './lib/dm.mjs'
 import { ensureUv } from './lib/uvfetch.mjs'
 
 export const name = 'bili-scroll'
@@ -57,7 +54,7 @@ export const Config = !z ? undefined : z.object({
   /** 自动评论 @ 使用者（默认关 —— 会拿用户的号说话，必须他自己开） */
   autoComment: z.boolean().default(false).extra('volatile', true),
   /** ⭐ 私信投递：off=只发评论（现状）· only=只私信（完全不公开评论）· both=评论 + 私信 */
-  dmMode: z.string().default('only').extra('volatile', true),
+  dmMode: z.string().default('off').extra('volatile', true),
   /** ⭐ 私信发给谁的 UID（数字）。要在 dmMode 不是 off 时填 */
   dmUid: z.natural().default(0).extra('volatile', true),
   /** 本地转写（没字幕的视频用 Whisper 转；默认关，要下模型） */
@@ -81,16 +78,6 @@ export const Config = !z ? undefined : z.object({
   /** 给那一轮叠一份插件自己的 patch（把 B站 MCP 挂上）—— 用户 profile 一个字都不用改 */
   overlayMcp: z.boolean().default(true).extra('volatile', true),
   /** 跑 headless 时的工作目录 */
-  /** ⭐ 人设提示词：使用者想让它怎么说话（比"填工作区"对新手友好得多）· 留空 = 按中性说话 */
-  personaPrompt: z.string().default('').extra('volatile', true),
-  /** 私信监听：只认主人本人发来的私信，有新消息就回一句 · 2.0 起默认开（查私信不花 token，只有真有人发消息才回一句） */
-  dmWatch: z.boolean().default(true).extra('volatile', true),
-  /** 私信监听间隔（分钟，最小 3） */
-  dmWatchMinutes: z.natural().default(1).extra('volatile', true),
-  /** 私信回复每天最多几条（防刷） */
-  dmReplyPerDay: z.natural().default(0).extra('volatile', true),
-  /** 只回这个 UID（0 = 用「私信发给谁」那个） */
-  dmOwnerUid: z.natural().default(0).extra('volatile', true),
   workspace: z.string().default('').extra('volatile', true),
   /** 日报形态：full=完整（现状）· brief=每条一两行 · off=不写报告（只发评论） */
   reportLevel: z.string().default('full').extra('volatile', true),
@@ -98,8 +85,6 @@ export const Config = !z ? undefined : z.object({
   replyToComments: z.boolean().default(false).extra('volatile', true),
   /** 每轮最多回几条 */
   replyPerRound: z.number().default(1).extra('volatile', true),
-  /** 自动收藏：0 = 不收藏；>0 = 目标收藏夹 fid（设置页下拉选）。动作在宿主侧完成，模型拿不到这只手 */
-  favFolderId: z.number().default(0).extra('volatile', true),
 })
 
 /**
@@ -125,19 +110,6 @@ export function apply(ctx, config) {
     return myVer
   }
   const stateDir = stateDirOf(ctx)
-  /**
-   * ⚠️ 2026-10-19（用户 `天文星球` 的截图）：装转写依赖时 uv 直接 exit 2 ——
-   *   `error: Could not acquire lock / failed to open file C:\Users\AP\AppData\Local\uv\cache\.lock: 拒绝访问 (os error 5)`
-   *   ⇒ **uv 默认把缓存放在 `%LOCALAPPDATA%\uv\cache`**，那地方一旦没权限（企业策略 / 杀软 / 别的用户建的）就彻底装不动 ✗
-   *   ⇒ 把 uv 的缓存 / 工具 / 解释器目录**全部钉在插件家里**（那儿一定可写）✓ ——
-   *   跟 `HF_HOME` 那次是同一类："环境差异由插件自己消掉，别让用户碰"。
-   */
-  const uvEnv = (extra = {}) => pyEnv({
-    UV_CACHE_DIR: join(stateDir, 'uv-cache'),
-    UV_TOOL_DIR: join(stateDir, 'uv-tools'),
-    UV_PYTHON_INSTALL_DIR: join(stateDir, 'uv-python'),
-    ...extra,
-  })
 
   // ⭐ "就绪"必须检查依赖真的装上了，不能只看目录存不存在
   //    （2026-10-15：只看目录，害一位真实用户"显示就绪但其实装失败"白折腾 ✗）
@@ -157,61 +129,11 @@ export function apply(ctx, config) {
   const hasPkg = (venvRoot, prefix) => {
     try { return readdirSync(sitePkgs(venvRoot)).some((n) => n.startsWith(prefix)) } catch { return false }
   }
-  // ⚠️ 2026-10-18 用户实测：徽章显示「环境已就绪」、B站也登录了，可一跑就 `ModuleNotFoundError: No module named 'mcp'`
-  //    ⇒ 原判据**只查了 bilibili_api**（0.1.2 修"假就绪"时留下的口子）⇒ 缺 `mcp` / `qrcode` 也照样说就绪 ✗
-  //    ⇒ 三个都得有：bilibili_api（查数据）· mcp（跑那一轮的 MCP 服务器）· qrcode（画登录二维码）
-  const VENV_DEPS = ['bilibili_api', 'mcp', 'qrcode']
-  const missingVenvDeps = () => VENV_DEPS.filter((n) => !hasPkg(join(stateDir, '.venv'), n))
-  const venvReadyNow = () => existsSync(venvPython()) && missingVenvDeps().length === 0
+  const venvReadyNow = () => existsSync(venvPython()) && hasPkg(join(stateDir, '.venv'), 'bilibili_api')
   const asrReadyNow = () => existsSync(asrPython()) && hasPkg(asrDir, 'faster_whisper')
   const cfgFile = join(stateDir, 'config.json')
-  /**
-   * 本地优先（2026-10-18，两个用户实证）：DSH 0.2.1 某些启动方式下 ctx.settings.update 会抛
-   *   profile reload requires the root Include entry（dsh-app-boot 的 reconcileProfilePatches）
-   *   ⇒ 写不进宿主 ⇒ 而 loadCfg 的规则是"宿主有值就以宿主为准" ⇒ 用户刚点的开关几秒后被压回原状，
-   *   表现成"开一个，另一个像被关掉"（其实是每个开关都在自己亮一下就被复位）。
-   * ⇒ 记一份"本地刚存、宿主没同步成功"的键，loadCfg 时这些键以本地为准；宿主同步成功就把它们删掉。
-   */
-  const overrideFile = join(stateDir, 'local-override.json')
-  const readOverride = () => {
-    try { const j = readJson(overrideFile, {}); return j && typeof j === 'object' ? j : {} } catch { return {} }
-  }
-  const markOverride = (keys, on) => {
-    try {
-      const cur = readOverride()
-      for (const k of keys) { if (on) cur[k] = Date.now(); else delete cur[k] }
-      writeFileSync(overrideFile, JSON.stringify(cur, null, 2), 'utf8')
-    } catch (e) { log('记 local-override 失败：' + (e && e.message ? e.message : e)) }
-  }
   const logFile = join(stateDir, 'duty.log')
   const outDir = join(stateDir, 'out')
-
-/** out/*.md 里每条视频的「档位」和「为什么值得」—— 给「它刷过的视频」列表补信息用（2026-10-21） */
-function reportMeta() {
-  const map = new Map()
-  let files = []
-  try {
-    files = readdirSync(outDir).filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f)).sort().reverse().slice(0, 60)
-  } catch { return map }
-  for (const f of files) {
-    let text = ""
-    try { text = readFileSync(join(outDir, f), "utf8") } catch { continue }
-    // 按 `### BVxxx` 切块
-    const blocks = text.split(/\n(?=###\s*BV)/)
-    for (const b of blocks) {
-      const m = b.match(/^###\s*(BV[0-9A-Za-z]+)/)
-      if (!m) continue
-      const bvid = m[1]
-      const tierM = b.match(/\*\*档位\*\*\s*[：:]\s*(值得看|可以看|不值当)/)
-      const whyM = b.match(/\*\*为什么值得\*\*\s*[：:]\s*([\s\S]*?)(?=\n\s*\*\*|$)/)
-      map.set(bvid, {
-        tier: tierM ? tierM[1] : "",
-        why: whyM ? whyM[1].replace(/\s+/g, " ").trim().slice(0, 160) : "",
-      })
-    }
-  }
-  return map
-}
   mkdirSync(outDir, { recursive: true })
 
   const log = (msg) => {
@@ -234,11 +156,9 @@ function reportMeta() {
    *     ② **定时器回调里绝不让异常外冒**（见 tick）—— 未捕获异常会杀掉整个宿主进程。
    */
   const DEFAULTS = {
-    dmWatch: true, dmWatchMinutes: 1, dmReplyPerDay: 0, dmOwnerUid: 0,
-    personaPrompt: '',
     perDay: 5, peakValley: false, noon: true, night: true, autoComment: false, transcribe: false, asrModel: 'small',
-    dmMode: 'only', dmUid: 0,
-    keywords: [], commentPerRound: 1, mentionName: '', pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
+    dmMode: 'off', dmUid: 0,
+    keywords: [], commentPerRound: 1, mentionName: '', pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1,
   }
   const normalize = (src, base) => {
     const out = { ...base }
@@ -271,34 +191,12 @@ function reportMeta() {
     if ('reportLevel' in p) p.reportLevel = ['full', 'brief', 'off'].includes(String(p.reportLevel)) ? String(p.reportLevel) : 'full'
     if ('replyToComments' in p) p.replyToComments = Boolean(p.replyToComments)
     if ('replyPerRound' in p) p.replyPerRound = Math.max(1, Math.min(Number(p.replyPerRound) || 1, 10))
-    if ('favFolderId' in p) p.favFolderId = Math.max(0, Math.floor(Number(p.favFolderId) || 0))
     if ('commentPerRound' in p) p.commentPerRound = Math.max(0, Math.min(Number(p.commentPerRound) || 0, 20))
     return p
   }
 
   const hostCfg = () => normalize(config, { ...DEFAULTS })       // 宿主那份（schema 校验过、默认值已填）
   const savedCfg = () => normalize(readJson(cfgFile, {}), { ...DEFAULTS })
-  /**
-   * ⭐⭐ 0.1.11（2026-10-19 · 第三批用户报"开关还是回弹"之后改的）
-   *   0.1.9 / 0.1.10 一直想"跟宿主对账"：宿主那边有值就以宿主为准 —— 但 DSH 0.2.1 的某些启动方式下
-   *   `ctx.settings.update` 写不进去（`profile reload requires the root Include entry`），
-   *   于是用户在插件面板点的每一个开关，5 秒轮询后都被宿主旧值压回 ⇒ 表现成"开一个，另一个像被关掉"。
-   *   ⇒ 现在改成记一份"**用户在插件面板里存过的键**"（`config.json` 的 `_set`）：
-   *     · 存过 ⇒ **插件这份说了算**（宿主写不进去也不会被压回）
-   *     · 没存过、DSH 原生设置里有值 ⇒ 听宿主的（原生页仍是正当入口）
-   *     · 都没有 ⇒ 默认值
-   *   ⚠️ 老版本没记过 `_set` ⇒ 第一次跑时按"和默认值不一样"反推一遍，免得升级上来的老用户又被弹回。
-   */
-  // ⚠️ 2026-10-19 事故（用户设置页停在"读设置中…"）：这两行以前漏了声明 ——
-  //   ESM 是严格模式，`hostDiff = diff` 直接抛 ReferenceError ⇒ loadCfg 挂 ⇒ /status 500
-  //   ⇒ 设置页永远读不到配置。**所有"正在用但没声明"的变量都是这种死法**，别再犯。
-  let hostDiff = []          // 插件这份和 DSH 原生设置那份不一样、且以插件为准的键
-  let lastDiffSig = ''       // 上一次记过日志的组合（同一种组合只写一行）
-  let touchedKeys = (() => {
-    const raw = readJson(cfgFile, {})
-    if (Array.isArray(raw._set)) return new Set(raw._set)
-    return new Set(Object.keys(DEFAULTS).filter((k) => k in raw && JSON.stringify(raw[k]) !== JSON.stringify(DEFAULTS[k])))
-  })()
   const CFG_SIG = ['perDay', 'mentionName', 'replyToComments', 'overlayMcp']   // 靠这几个键认出"哪一行是我们"
   let settingsRow = { at: 0, row: null }
   /**
@@ -330,54 +228,32 @@ function reportMeta() {
     // ⭐ 读回来统一过一遍范围：原生设置页那边我们是钳不到写的（见 clampPatch 的注释）
     if (!row) return clampPatch(saved)
     const user = row.user || {}
-    // ⭐ 2026-10-19（另一位用户的 dsh 给出的更彻底的一招）：**别用闭包里那份 `config` 当宿主基准** ——
-    //    桌面版里它是挂载时的快照，之后写进 `cordis.patch.yml` 的值不会热刷新进来 ✗
-    //    ⇒ 用 `describe()` 这一行里的 `value`（当前 patch 解析出来的现值）当基准，拿不到才退回 `config` ✓
-    const out = normalize(row.value && typeof row.value === 'object' ? row.value : config, { ...DEFAULTS })
-    // ⚠️ 2026-10-18（用户实证 + 他的 dsh 定位）：`pythonPath` 是**装依赖时自动写的**，
-    //    但它一旦在 DSH 原生设置里有过值（默认 "python"），就会被宿主覆盖回来 ⇒
-    //    「重装依赖」日志写着"已把 pythonPath 设为 venv"，实际生效的还是系统那个空壳 python
-    //    ⇒ 画二维码 import 不到 qrcode ⇒ **永远不出码** ✗
-    //    ⇒ 这个键不让宿主对账（它由插件自己算出来，不该被界面上的旧值压住）
-    const ov = readOverride()   // 本地刚存、宿主没同步成功的键 ⇒ 以本地为准
-    const touched = new Set([
-      ...touchedKeys,            // 用户在我们面板里保存过的键（0.1.11 的判据）
-      ...Object.keys(ov),
-      'pythonPath',              // 插件自己算出来的路径
-      // ⭐ 2026-10-19（一位用户的 dsh 分析出来的）：桌面版 0.2.x 里，写进 cordis.patch.yml 的设置
-      //    不会热刷新到正在运行的实例 ⇒ 我们从 ctx 读到的那份 config 一直是挂载时的旧默认值
-      //    ⇒ 只要某个键"config.json 里的值和默认值不一样"，就说明有人显式设过它，必须以本地为准，
-      //    否则在桌面版上会被那份旧默认值压回（用户看到的就是"开关自己弹回去"）
-      ...Object.keys(DEFAULTS).filter((k) => JSON.stringify(saved[k]) !== JSON.stringify(DEFAULTS[k])),
-    ])
-    // ⭐ 2026-10-19：把"插件这份和 DSH 原生设置那份不一样、且以插件为准"的键记下来 ——
-    //   只记不吵（每台机器每种组合只写一行日志），`/status` 里也能看到，排查时一眼够用
-    const diff = []
-    for (const k of Object.keys(DEFAULTS)) {
-      if (touched.has(k)) { out[k] = saved[k]; continue }        // 我们这边管 ⇒ 不再被宿主压回
-      if (user[k] !== undefined) { out[k] = user[k]; continue }  // 用户在 DSH 原生页改的 ⇒ 听他的
-      out[k] = saved[k]
+    const out = { ...hostCfg() }
+    for (const k of Object.keys(DEFAULTS)) if (user[k] === undefined) out[k] = saved[k]
+    const merged = clampPatch(out)
+    // 2026-10-22：设置层里残留的 "python" 不应该盖掉 config.json 已经写好的
+    // venv 绝对路径 —— 否则 MCP 会启动系统 Python，报 No module named 'mcp'。
+    if ((!merged.pythonPath || merged.pythonPath === 'python') && saved.pythonPath && saved.pythonPath !== 'python') {
+      merged.pythonPath = saved.pythonPath
     }
-    for (const k of touched) {
-      if (k in DEFAULTS && user[k] !== undefined && JSON.stringify(user[k]) !== JSON.stringify(out[k])) diff.push(k)
+    // 2026-10-22：DSH 设置层的 user 会把未显式改过的布尔字段也报成默认值，
+    // 导致插件设置页里打开「自动评论 / 回复评论 / 峰谷自动刷」后，5 秒轮询
+    // refreshCfg 又读回默认值，开关自己弹回去。插件设置页写入时同时写
+    // config.json 和宿主设置，因此这里以插件自己的 config.json 为准。
+    for (const k of [
+      'perDay', 'peakValley', 'noon', 'night', 'autoComment', 'transcribe', 'asrModel',
+      'dmMode', 'dmUid', 'keywords', 'commentPerRound', 'mentionName',
+      'dshBin', 'headlessProfile', 'overlayMcp', 'workspace', 'reportLevel',
+      'replyToComments', 'replyPerRound',
+    ]) {
+      merged[k] = saved[k]
     }
-    hostDiff = diff
-    const sig = diff.slice().sort().join(',')
-    if (sig && sig !== lastDiffSig) {
-      lastDiffSig = sig
-      log(`这些键以插件面板为准（DSH 原生设置里那份不一样）：${sig}`)
-    }
-    return clampPatch(out)
+    return merged
   }
   const cfg = loadCfg()
   // ⭐ 配置是"随时可能被设置页就地改掉"的东西 ⇒ 每个入口用之前重算一遍（cfg 这个对象要一直指向同一份）
   const refreshCfg = () => { Object.assign(cfg, loadCfg()) }
-  const saveCfg = (patch) => {
-    Object.assign(cfg, normalize(patch, cfg))
-    // ⭐ 记下"这些键由插件面板说了算"（0.1.11：loadCfg 拿它决定谁赢）
-    for (const k of Object.keys(patch || {})) if (k in DEFAULTS) touchedKeys.add(k)
-    writeJson(cfgFile, { ...cfg, _set: [...touchedKeys] })
-  }
+  const saveCfg = (patch) => { Object.assign(cfg, normalize(patch, cfg)); writeJson(cfgFile, cfg) }
   /**
    * ⭐ 同时写一份到宿主：不写的话会出现死结 —— 某个键一旦在原生设置页设过就由宿主说了算，
    *    插件页再改那个键就成了"改了没反应" ✗。写失败不算致命（config.json 那份还在），把话带回给用户。
@@ -389,24 +265,11 @@ function reportMeta() {
         throw Object.assign(new Error('DSH 这边没有可写的设置表单（值只落在插件自己的 config.json 里）'), { noForm: true })
       }
       await ctx.settings.update(row.ns, patch, row.revision)
-      // ⭐ READBACK（2026-10-18）：update() 不报错 ≠ 值真的生效 ✗
-      //   三四位用户装了 0.1.9 后开关照样弹回，而界面**没有**出现"没同步"提示
-      //   ⇒ 说明 host.ok 判成了成功、值却没落进生效层 ⇒ 必须**回读用户层**再确认一遍 ✓
-      const after = settingsDesc(true)
-      const user = after?.user || {}
-      const bad = Object.keys(patch).filter((k) => {
-        const want = patch[k]
-        const got = user[k]
-        if (Array.isArray(want)) return JSON.stringify(want) !== JSON.stringify(got)
-        if (want !== null && typeof want === "object") return true   // 配置里没有嵌套对象，出现就按没写进去处理
-        return String(got) !== String(want)
-      })
-      if (bad.length) throw Object.assign(new Error("写入没生效（读回来还是旧值）：" + bad.join(", ")), { stale: true })
       return row.ns
     }
     try { return { ok: true, ns: await attempt(false) } }
     catch (e) {
-      if (!e?.noForm) {   // revision 过期 / 回读不一致 ⇒ 重取一次再写
+      if (!e?.noForm) {   // revision 过期（刚有别人改过）⇒ 重取一次再写
         try { return { ok: true, ns: await attempt(true), retried: true } } catch (e2) { e = e2 }
       }
       log(`写 DSH 设置失败：${e?.message ?? e}`)
@@ -422,36 +285,7 @@ function reportMeta() {
     const clean = clampPatch(patch)
     saveCfg(clean)
     const host = await saveCfgHost(clean)
-    // 宿主写成功 ⇒ 恢复对账；失败 ⇒ 记成"本地优先"，别让界面把它们压回去
-    // ⭐ 无条件本地优先（2026-10-18 第二次修）：
-    //   三四位用户装了 0.1.9、界面没有"没同步"提示、开关照样弹回
-    //   ⇒ 往 DSH 写这一步既没报错、回读也看不出差别，但**生效值仍是旧的**
-    //   （多半是 profile 层压过了 user 层）✗
-    //   ⇒ 不再指望 DSH 那边：只要是从**插件面板**保存的键，读配置时一律以插件自己那份为准 ✓
-    //   ⚠️ 代价：同名的项若在 DSH 原生设置页改，以插件面板为准（我们的设置页才是"正式的家"）。
-    markOverride(Object.keys(clean), true)
-    if (!host.ok) log('⚠️ 这几项没能同步到 DSH 原生设置，改为以插件自己的值为准：' + Object.keys(clean).join(', ') + '（' + host.error + '）')
     return { clean, host }
-  }
-
-  // ⭐ 2026-10-21 一次性迁移：2.0 把「私信双向」改成默认开、间隔 1 分钟、去掉每日上限，
-  //    但老用户的 config.json 里存着旧默认值（false / 5 / 3）⇒ 会盖掉新默认。
-  //    判据：三项**都还停在旧默认**才动（说明是真没碰过），碰过任何一项就尊重用户。
-  const MIG_200 = () => {
-    const marker = join(stateDir, '.mig-2.0.0')
-    try {
-      if (existsSync(marker)) return
-      const saved = readJson(join(stateDir, 'config.json'), {}) || {}
-      const oldAll = saved.dmWatch === false
-        && Number(saved.dmWatchMinutes) === 5
-        && Number(saved.dmReplyPerDay) === 3
-      if (oldAll) {
-        persistCfg({ dmWatch: true, dmWatchMinutes: 1, dmReplyPerDay: 0 })
-          .then(() => log('已把「私信双向」迁到 2.0 的默认：开着、每 1 分钟查一次、不限条数'))
-          .catch((e2) => log('迁移私信默认值失败（不影响使用）：' + String(e2?.message ?? e2)))
-      }
-      writeFileSync(marker, String(Date.now()), 'utf8')
-    } catch (e2) { log('迁移检查出错（不影响使用）：' + String(e2?.message ?? e2)) }
   }
 
   ensureHomeFiles(pluginDir, stateDir, log)
@@ -463,21 +297,22 @@ function reportMeta() {
 
   let mcp = null
   let mcpKey = ''
-  const mcpKeyNow = () => `${cfg.pythonPath}|${join(stateDir, 'mcp_server.py')}`
+  const mcpKeyNow = () => `${effectivePython()}|${join(stateDir, 'mcp_server.py')}`
 
   const ensureMcp = async () => {
+    refreshCfg()
     if (mcp?.running && mcpKey === mcpKeyNow()) return mcp
     if (mcp) { mcp.stop(); mcp = null }
     const script = join(stateDir, 'mcp_server.py')
     if (!existsSync(script)) throw new Error(`家里没有 mcp_server.py（应有 ${script}）—— 装上插件后重启一次 dsh 会自动铺好`)
     mcpKey = mcpKeyNow()
     mcp = new McpClient({
-      command: cfg.pythonPath || 'python',
+      command: effectivePython(),
       args: [script],
       cwd: stateDir,                     // 凭证落在家里 ✓
       // ⭐ 这个内置的 Python MCP 会往 stdout 打中文（ensure_ascii=False）；
       //    Windows 默认 GBK 的话，中文/emoji 一进管道就可能炸 ⇒ 钉死 UTF-8
-      env: uvEnv(),
+      env: pyEnv(),
       log,
     })
     return mcp
@@ -611,8 +446,6 @@ function reportMeta() {
         ranToday: st.day === dayKey(now) ? Number(st.count || 0) : 0,
         pickedToday: countPickedToday(now),
         perDay: cfg.perDay,
-        // ⭐ 2026-10-19：这一轮会用哪个 dsh（空 = 没找到 ⇒ 那一轮根本跑不起来）
-        dshCli: dshCliCached(),
         windows: Object.fromEntries(Object.entries(WINDOWS).map(([k, w]) => [k, {
           label: w.label, start: w.start, end: w.end,
           switchOn: Boolean(cfg[k]),
@@ -645,8 +478,9 @@ function reportMeta() {
       + '⚠️ 二维码大约 180 秒有效，出码要马上递过去；手机上确认时选「记住我」那种长期登录。',
     parameters: {},
     async execute() {
+      refreshCfg()
       const { key, url } = await loginStart()
-      const png = await renderQrPng(cfg.pythonPath, stateDir, url)
+      const png = await renderQrPng(effectivePython(), stateDir, url)
       return {
         ok: true, key, url, png,
         hint: png ? '用 present 把这张 PNG 推给本人扫；扫完调 bili_login_poll' : '没画出 PNG：先去设置里点「建 venv 装依赖」（venv 里要有 qrcode）',
@@ -685,6 +519,7 @@ function reportMeta() {
       + '私信投递：`{"dmMode":"only","dmUid":12345678}`（dmMode = off / only / both）。',
     parameters: { patch: { type: 'object', additionalProperties: true, description: '要改的字段（可省）' } },
     async execute(args) {
+      refreshCfg()
       let host = null
       if (args?.patch && typeof args.patch === 'object' && !Array.isArray(args.patch)) {
         // ⭐ 设置页显式设过的键以宿主为准 ⇒ 必须跟着写一份，否则"改了没反应"（钳范围也在这里）
@@ -740,27 +575,17 @@ function reportMeta() {
   // ⭐ 一键升级：由宿主自己跑 `dsh plugin --profile web add dsh-bili-scroll`
   //    ⚠️ 装完必须重启 dsh 才生效；⚠️ Windows 上"替换正在运行的插件"可能被文件占用挡住（我们踩过）
   let upgrading = false
-  let lastUpdateSource = 'npm'   // 上一次「检查更新」是从哪儿查到新版的：npm / github（一键升级按它选装法）
-  let ghUpdateCache = null
   const runUpgrade = () => {
     if (upgrading) return { ok: true, busy: true, log: installLogFile, hint: '正在升级，别重复点' }
     upgrading = true
-    const spec = lastUpdateSource === 'github' ? 'github:c1overzz/dsh-bili-scroll' : 'dsh-bili-scroll'
-    appendInstall('\n=== ' + new Date().toISOString() + ' 开始升级（add ' + spec + '）===\n')
+    appendInstall('\n=== ' + new Date().toISOString() + ' 开始升级（add dsh-bili-scroll）===\n')
     ;(async () => {
       try {
         const dsh = resolveDsh()
         // ⭐ 照抄那一轮的形状：resolveDsh 返回 { command, args, shell }
         //    （写错就退化成裸 'dsh'，而宿主 PATH 里常常没有它 ⇒ 静默失败）
-        // ⚠️ 2026-10-19：找不到 dsh 时不再硬跑，直接把要做的事说清楚
-        if (dsh.missing) {
-          appendInstall('=== 没法自动升级：找不到 dsh。' + dsh.hint + ' ===\n')
-          appendInstall('=== 也可以自己手动跑一次：dsh plugin --profile web add dsh-bili-scroll ===\n')
-          upgrading = false
-          return
-        }
         let cmd = dsh.command || 'dsh'
-        let args = [...(dsh.args || []), 'plugin', '--profile', 'web', 'add', spec]
+        let args = [...(dsh.args || []), 'plugin', '--profile', 'web', 'add', 'dsh-bili-scroll']
         if (dsh.shell) { args = ['/c', cmd, ...args]; cmd = 'cmd.exe' }
         appendInstall('$ ' + cmd + ' ' + args.join(' ') + '\n')
         const code = await spawnTo(cmd, args, { sink: appendInstall })
@@ -771,136 +596,40 @@ function reportMeta() {
     return { ok: true, started: true, log: installLogFile, hint: '正在升级 —— 完成后重启一次 dsh 才生效' }
   }
 
-  /**
-   * ⭐⭐ 2026-10-19（主人："改一下，让他的 dsh 直接弄好不行吗"）：**自己去把 dsh 找出来，别让用户手填**。
-   *   桌面版（Electron）不是 npm -g 装的、`dsh` 也不在 PATH 上 ⇒ 老逻辑只猜三个固定位置，猜不到就让用户填 `dshBin` ✗
-   *   ⇒ 现在从近到远挨个试，最后**在应用目录里做一次有界递归搜索**（只认 `dsh/lib/bin.js`，最多几千个目录就收手）。
-   */
-  const findDshCli = () => {
-    // ① 用户显式填的
+  const resolveDsh = () => {
     const explicit = String(cfg.dshBin || '').trim()
-    if (explicit && existsSync(explicit)) return explicit
-    // ② 让 Node 的解析器替我们找（web profile / 桌面版 app 目录，两条路都可能命中）
-    try {
-      const req = createRequire(import.meta.url)
-      for (const spec of ['@deepseek-ai/dsh/lib/bin.js', '@deepseek-ai/dsh']) {
-        try { const p = req.resolve(spec); if (p && existsSync(p)) return p } catch { /* 换下一个 */ }
-      }
-    } catch { /* 解析器不可用就跳过 */ }
-    // ③ npm 全局 / POSIX 常见位置
-    for (const g of [
+    if (explicit && existsSync(explicit)) return { command: process.execPath, args: [explicit], shell: false }
+    // 常见的全局安装位置（Windows 的 npm 前缀 / POSIX 的 lib）
+    const guesses = [
       join(process.env.APPDATA || '', 'npm', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
-      join(process.env.ProgramFiles || '', 'nodejs', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
       '/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
       '/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
-    ].filter(Boolean)) if (existsSync(g)) return g
-    // ④ 桌面版：在应用目录里有界搜一遍
-    const roots = []
-    if (process.resourcesPath) roots.push(process.resourcesPath)
-    try { roots.push(join(dirname(process.execPath), 'resources')) } catch { /* 没有就算了 */ }
-    const tried = []
-    for (const root of roots) {
-      if (!root || tried.includes(root) || !existsSync(root)) continue
-      tried.push(root)
-      const hit = scanForDsh(root, 0, { n: 0 })
-      if (hit) return hit
-    }
-    return ''
-  }
-  // 有界递归：深度 ≤ 7、最多翻 4000 个目录（桌面版 resources 里目录不小，别再往上加了）
-  const scanForDsh = (dir, depth, budget) => {
-    if (depth > 7 || budget.n > 4000) return ''
-    let ents = []
-    try { ents = readdirSync(dir, { withFileTypes: true }) } catch { return '' }
-    for (const d of ents) {
-      if (!d.isDirectory()) continue
-      if (++budget.n > 4000) return ''
-      const p = join(dir, d.name)
-      if (d.name === 'dsh') {
-        const bin = join(p, 'lib', 'bin.js')
-        if (existsSync(bin)) return bin
-      }
-      const hit = scanForDsh(p, depth + 1, budget)
-      if (hit) return hit
-    }
-    return ''
-  }
-
-  // ⭐ 2026-10-19：以前找不到 dsh 就退到裸 `dsh` 硬跑 ⇒ 必然 spawn 失败、只留 exit 1 + 乱码。
-  //    现在先看 PATH 里到底有没有它：**没有就明确返回 missing**（调用方会停下来说清楚），
-  //    有才允许"最后一招"（有些人是手动配过 PATH 的 npm 全局）✓
-  const hasDshOnPath = () => {
-    const exts = process.platform === 'win32' ? ['', '.cmd', '.exe', '.bat', '.ps1'] : ['']
-    const dirs = String(process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':')
-    for (const d of dirs) {
-      const dir = d.replace(/^"|"$/g, '').trim()
-      if (!dir) continue
-      for (const e of exts) {
-        try { if (existsSync(join(dir, 'dsh' + e))) return true } catch { /* 忽略坏路径 */ }
+    ].filter(Boolean)
+    // ⭐ 2026-10-16（issue #5 / #6 / #7）：**桌面版是 Electron 安装包，不是 npm -g 装的** ⇒ 上面几条全找不到
+    //    ⇒ 老逻辑退到 `dsh`（PATH 里没有这个命令）⇒ 那一轮必败、而且只留下一句 exit 1 ✗
+    //    桌面版把 dsh 打在应用里 ⇒ 按 `process.resourcesPath` 猜几个位置（找到就用；找不到就**明说**）
+    if (process.resourcesPath) {
+      for (const rel of [
+        ['app.asar.unpacked', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'],
+        ['app', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'],
+        ['node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'],
+      ]) {
+        const p = join(process.resourcesPath, ...rel)
+        if (existsSync(p)) return { command: process.execPath, args: [p], shell: false }
       }
     }
-    return false
-  }
-
-  let autoDshLogged = ''
-  // ⭐ 缓存：设置页每 5 秒拉一次 /status，不能让"找不到时的递归搜索"每 5 秒跑一遍
-  let dshCliCache = { v: null, at: 0 }
-  const dshCliCached = () => {
-    const now = Date.now()
-    if (dshCliCache.v !== null && now - dshCliCache.at < 60_000) return dshCliCache.v
-    const v = findDshCli()
-    dshCliCache = { v, at: now }
-    return v
-  }
-  const resolveDsh = () => {
-    const cli = dshCliCached()
-    if (cli) {
-      const explicit = String(cfg.dshBin || '').trim()
-      if (cli !== explicit && autoDshLogged !== cli) {
-        autoDshLogged = cli
-        log(`自动找到 dsh：${cli}（不用手填 dshBin 了）`)
-      }
-      return { command: process.execPath, args: [cli], shell: false }
-    }
+    for (const g of guesses) if (existsSync(g)) return { command: process.execPath, args: [g], shell: false }
     // ⚠️ 走到这儿就是真找不到 —— 一定要出声（静默失败比报错更坏）
-    // ⭐ 2026-10-19（一位桌面版用户的 duty.log）：以前这里**照样返回 `dsh`** ⇒ 那一轮必然 spawn 失败、
-    //    只留一句 exit 1 和 `'dsh' 不是内部或外部命令` 的乱码 ⇒ 用户完全不知道该怎么办 ✗
-    // ⭐ 但也不能一味"判死"：有些人的 PATH 里确实有 dsh（例如手动配过 PATH 的 npm 全局）
-    //    ⇒ 保留**最后一招**：用 PATH 里那个试一次（日志说明白），失败时报告里也会写清原因 ✓
-    const hint = '已经把常见位置和应用目录都翻过一遍了。可以手动把「dsh 路径」填成 <应用目录>/…/@deepseek-ai/dsh/lib/bin.js，或改用 npm 装的 dsh'
-    if (!hasDshOnPath()) {
-      log('⚠️ 找不到 dsh（常见位置、应用目录、PATH 里都没有）⇒ ' + hint)
-      return { missing: true, hint }
-    }
-    log('⚠️ 没在常见位置找到 dsh，最后试一下 PATH 里的 `dsh` ⇒ ' + hint)
-    return { command: 'dsh', args: [], shell: true, fallback: true, hint }
-  }
-
-  // ⭐ 私信默认化（2026-10-21）：用户常常只填了「@ 谁」的昵称、没填 UID
-  //    ⇒ 我们按昵称替他查一次 mid 并缓存；**查不到就降级回只发评论**（绝不能"默认私信"却一条都送不出去 ✗）
-  let dmUidCache = 0
-  async function warmDmUid() {
-    if (Number(cfg.dmUid) > 0) return Number(cfg.dmUid)
-    if (cfg.dmMode === 'off') return 0
-    const name = String(cfg.mentionName || '').trim()
-    if (!name) return 0
-    try {
-      const mid = await resolveUid(stateDir, name, log)
-      if (mid > 0) { dmUidCache = mid; log(`私信对象：${name} → ${mid}`) }
-      return mid
-    } catch (e) { log('查私信 UID 出错：' + String(e?.message ?? e)); return 0 }
+    log('⚠️ 找不到 dsh：桌面版多半不是 npm 全局安装的 ⇒ 请在设置里把「dsh 路径」指到 <应用目录>/…/@deepseek-ai/dsh/lib/bin.js，或改用 npm 装的 dsh')
+    return { command: 'dsh', args: [], shell: true }
   }
 
   const promptFor = () => {
     // ⭐ 章程取哪一份：家里那份优先（ensureCharter 保证铺好；他改过的话就是他那份，升级的事由 ensureCharter 记账处理）
-    const duty = charterPath(pluginDir, stateDir)
-    // ⭐ 2026-10-19（issue #36）：这里以前是**在路径字符串上**做 split('<家目录>') —— 空操作 ✗
-    //    章程内容还是让那一轮自己去读，里面 5 处占位符原样进了模型的眼睛（它读成 ~）。
-    //    现在改成：宿主读内容 → 把占位符换成真路径 → 内联进提示词（也省掉它一次读文件）✓
-    let charterText = ''
-    try {
-      charterText = readFileSync(duty, 'utf8').split('<家目录>').join(stateDir)
-    } catch { /* 读不到就退回"让它自己读路径"（下面提示词里会说） */ }
+    let duty = charterPath(pluginDir, stateDir)
+    // ⭐ 2026-10-17（issue #8④）：章程里的 `<家目录>` 这种占位符会被模型读成 `~`，实测**整轮转写白跑** ✗
+    //    ⇒ 在拼提示词这一步把**绝对路径**填进去，别让它猜（我们的老规矩：提示词一律给绝对路径）
+    try { duty = String(duty).split('<家目录>').join(stateDir) } catch { /* 替换失败就按原文用 */ }
     const kws = Array.isArray(cfg.keywords) ? cfg.keywords.filter(Boolean) : []
     // ⭐ 开场先让它读**工作区**的 AGENTS.md —— 这一轮的工作目录就是使用者的工作区，
     //    AGENTS.md 本来就会自动注入；这里再点一句，保证它真按使用者的设定来（别人的设定同理）。
@@ -912,32 +641,8 @@ function reportMeta() {
       //    也就是 **dsh 进程自己的工作目录** —— 那对多数人根本不是他的工作区 ✗
       //    ⇒ 读错人设、甚至把别的目录的设定读进来 ✓
       //    ⭐ 现在的规矩：**留空 = 不读设定**（宁可按中性说话，也别猜错 ✓）；要按人设就自己填工作区 ✓。
-    // ⭐ 2026-10-21：优先用「人设提示词」这个框（主人原话：工作区确实可以不要，有人不会用，改成直接填人设提示词确实更方便）
-    // ⭐ 2026-10-21：人设框既收「文字」，也收「一个路径」——填路径就去读那个文件/目录下的 AGENTS.md，
-    //    这样"从一个文件导入"和"自己写一段"用同一个框，不用额外按钮 ✓（老用户的工作区兜底逻辑不变）
-    const personaRaw = String(cfg.personaPrompt || '').trim()
-    let persona = personaRaw
-    let personaFromFile = ''
-    if (personaRaw && !personaRaw.includes('\n')) {
-      const looksPath = /^[A-Za-z]:[\\/]/.test(personaRaw) || /^\\\\/.test(personaRaw) || personaRaw.startsWith('~/')
-      if (looksPath) {
-        try {
-          let f = personaRaw.replace(/^~\//, process.env.USERPROFILE ? process.env.USERPROFILE + '/' : '~/')
-          if (existsSync(f) && statSync(f).isDirectory()) f = join(f, 'AGENTS.md')
-          if (existsSync(f)) {
-            persona = readFileSync(f, 'utf8')
-            personaFromFile = f
-          }
-        } catch { /* 读不到就当普通文字 */ }
-      }
-    }
-    if (persona) {
-      ownerDoc = '\n\n===== 使用者的人设' + (personaFromFile ? '（读自 ' + personaFromFile + '）' : '提示词') + '（**按这个来**）=====\n'
-        + persona.slice(0, 6000)
-        + '\n===== 人设结束 =====\n'
-    }
       const wsDir = String(cfg.workspace || '').trim()
-      const agents = (!persona && wsDir) ? join(wsDir, 'AGENTS.md') : ''
+      const agents = wsDir ? join(wsDir, 'AGENTS.md') : ''
       if (agents && existsSync(agents)) {
         const text = readFileSync(agents, 'utf8')
         ownerDoc = '\n\n===== 使用者的 AGENTS.md（他写给自己 AI 的人设与准则，**按这个来**）=====\n'
@@ -951,22 +656,15 @@ function reportMeta() {
     const left = Math.max(0, quota - already)
     // ⭐ 投递方式（2026-10-17 加）：dmMode = off（只评论）· only（只私信）· both（都发）
     //    commentOn 是"这一轮到底能不能发公开评论"的唯一判据（工具层的闸用的是同一套逻辑）
-    const dmUidEff = Number(cfg.dmUid) || dmUidCache
-    const dmDegraded = cfg.dmMode === 'only' && !(dmUidEff > 0)
-    const dmModeEff = dmDegraded ? 'off' : cfg.dmMode
-    if (dmDegraded) log('⚠️ 选的是「只私信」，但不知道发给谁（没填 UID、也没填「@ 谁」，或查不到）⇒ 这一轮降级成只发评论')
-    const commentOn = Boolean(cfg.autoComment && cfg.mentionName && dmModeEff !== 'only')
-    const dmOn = Boolean(dmModeEff !== "off" && dmUidEff > 0)
+    const commentOn = Boolean(cfg.autoComment && cfg.mentionName && cfg.dmMode !== 'only')
+    const dmOn = Boolean(cfg.dmMode !== 'off' && Number(cfg.dmUid) > 0)
     return `你是这个账号的 B站 助手。`
       + `下面是使用者的设定（如果有）—— **按它来**，别用你默认那套人格。`
       + ownerDoc
       + (ownerDoc
         ? ''
         : '⭐ 这一轮**没有**拿到使用者的设定（他没填「工作区」，或那个目录里没有 `AGENTS.md`）⇒ **按中性说话**：别扮演任何人、也别自己编一套设定 ✓。')
-      + (charterText
-          ? '下面是**值班章程**（里面的「<家目录>」已经替换成真实绝对路径了）—— 严格按它执行：\n\n'
-            + charterText + '\n\n按上面的章程刷一轮 B站，'
-          : `然后读章程 ${duty}，按里面的要求刷一轮 B站（章程里的 <家目录> 指的是 ${stateDir}），`)
+      + `然后读章程 ${duty}，按里面的要求刷一轮 B站，`
       + (cfg.reportLevel === 'brief'
         ? `日报写成薄版：每条一两行（值不值得 + 链接）就够，别写长摘要。`
         : cfg.reportLevel === 'off'
@@ -991,11 +689,11 @@ function reportMeta() {
       + `这是**给以后检索用**的（报告是给人看的，归档是给"回头翻"用的），别省略、也别只写挑中的。`
       + `自动评论并 @ ${cfg.mentionName || '（还没填要 @ 谁）'} 是${commentOn
         ? `开着的（每轮最多 ${cfg.commentPerRound} 条评论，每条在正文里纯文本 @ ${cfg.mentionName}，150 字内）`
-        : (dmModeEff === 'only'
+        : (cfg.dmMode === 'only'
           ? '关着的 —— 当前是「**只私信**」模式：**这一轮一条公开评论都不许发**，改走私信'
           : '关着的（只写报告，别发评论）')}。`
       + (dmOn
-        ? `⭐⭐ **私信投递**：用 bili_send_message 把这一轮的结果发到 UID **${dmUidEff}**。`
+        ? `⭐⭐ **私信投递**：用 bili_send_message 把这一轮的结果发到 UID **${Number(cfg.dmUid)}**。`
           + `内容**别照抄评论那套**：把本轮每条值得的写成 **标题 + 链接 + 一句话理由**`
           + `（私信是私人渠道、不占别人的地方，可以比评论长一点，但**别啰嗦**）。`
           + `🔴🔴 **但私信有长度上限 —— 实测 500 字符就顶了**：`
@@ -1036,66 +734,29 @@ function reportMeta() {
   const mcpWhitelist = () => {
     const list = ['bili_search', 'bili_subtitle', 'bili_comments', 'bili_video_info']
     if (cfg.autoComment || cfg.replyToComments) list.push('bili_reply')   // 只有真要发评论才给这只
-    // ⭐ 2026-10-19（issue #25 / #16 的实证，做法参考社区 PR #37）：私信开着却忘了给 bili_send_message ⇒
-    //   模型手里压根没有这只工具 ⇒ 表现成"开关也开了、这一轮也跑了，但从来没发出去过" ✗
-    //   ⇒ dmMode 不是 off、且填了收件人 UID 才放进去（关着就不给，白名单别松）
-  if (String(cfg.dmMode || 'off') !== 'off' || cfg.dmWatch) list.push('bili_send_message')   // 2026-10-21：UID 可能靠昵称查，别再拿 dmUid>0 当条件
     return list
   }
 
   const ensureOverlay = () => {
+    if (!cfg.overlayMcp) return null
     const file = join(stateDir, 'headless-overlay.yml')
     const script = join(stateDir, 'mcp_server.py')
     const posix = (p) => String(p).replace(/\\/g, '/')
-    const yml = []
-    // ⭐⭐ 2026-10-18（用户 `Elec-Tron-lc` 递来完整报告，逐条核过）：
-    //    DSH **0.2.1-rc.2** 的 `@deepseek-ai/dsh-headless` 自带 patch 把三个服务 `disabled: true` 了 ——
-    //    `credentials` / `authorization` / `deepseek-account` ⇒ 那一轮既用不了账号模型、也读不到凭证库里的 key
-    //    （`resolveApiKey` 退到 env 也没有）⇒ `ACCOUNT_SIGN_IN_REQUIRED` / `NO_ADAPTER: buddy`。
-    //    ⭐ 我们的 overlay 是**最后**叠加的一层（bundle → profile → `--patch`）⇒ 在这里把它们打开，
-    //    用户什么都不用配（0.2.0 时代没这三条禁用，所以以前不炸）。
-    //    ⚠️ 老版本没有这些 id 时 DSH 会把未知条目当无事发生，不会因此起不来。
-    for (const id of ['credentials', 'authorization', 'deepseek-account']) {
-      yml.push('- id: ' + id, '  disabled: false', '')
-    }
-    // ⭐⭐ 2026-10-20（社区 PR #50 指出，DSH 0.2.1-rc.2 桌面版实测）：**光开那三个服务还不够** ——
-    //    仍然会报 `MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"`，
-    //    因为 headless 的 `agent-default-model` 默认解析到 `deepseek-official`（要 API key），
-    //    而"账号登录"的机器没有 key；桌面版是靠 profile 那层 patch 把路由指到 deepseek-account 的，
-    //    **我们这一轮的一次性 overlay 没有那一层** ⇒ 还没发请求就死了。
-    //    ⇒ overlay 里补一条 agent-default-model，**优先跟随用户当前选的模型**；拿不到就不写（保持原行为）✓
-    try {
-      const sel = ctx.get('agentDefaultModel')?.currentSelection?.() ?? null
-      const selProvider = sel?.provider ?? sel?.providerId
-      const selModel = sel?.model ?? sel?.modelId
-      if (selProvider && selModel) {
-        yml.push(
-          '- id: agent-default-model',
-          '  config:',
-          '    provider: ' + String(selProvider),
-          '    model: ' + String(selModel),
-          ...(sel.reasoningEffort ? ['    reasoningEffort: ' + String(sel.reasoningEffort)] : []),
-          '',
-        )
-      }
-    } catch { /* 老版本没有这个服务 —— 不写就退回原行为 */ }
-    if (cfg.overlayMcp) {
-      yml.push(
-        '- insert:',
-        '    - id: mcp-bili-duty',
-        "      name: '@deepseek-ai/dsh-mcp-client'",
-        '      config:',
-        '        serverName: bili-duty',
-        '        transport: stdio',
-        `        command: '${posix(cfg.pythonPath || 'python')}'`,
-        '        args:',
-        `          - '${posix(script)}'`,
-        '        env:',
-        `          BILI_MCP_TOOLS: '${mcpWhitelist().join(',')}'`,
-        '',
-      )
-    }
-    try { writeFileSync(file, yml.join('\n'), 'utf8'); return file } catch (e) { log(`写 overlay 失败：${e?.message ?? e}`); return null }
+    const yml = [
+      '- insert:',
+      '    - id: mcp-bili-duty',
+      "      name: '@deepseek-ai/dsh-mcp-client'",
+      '      config:',
+      '        serverName: bili-duty',
+      '        transport: stdio',
+      `        command: '${posix(cfg.pythonPath || 'python')}'`,
+      '        args:',
+      `          - '${posix(script)}'`,
+      '        env:',
+      `          BILI_MCP_TOOLS: '${mcpWhitelist().join(',')}'`,
+      '',
+    ].join('\n')
+    try { writeFileSync(file, yml, 'utf8'); return file } catch (e) { log(`写 overlay 失败：${e?.message ?? e}`); return null }
   }
 
   /**
@@ -1114,10 +775,7 @@ function reportMeta() {
       log(`评论复核开始（${why}）`)
       const r = await verifyRecent(stateDir, { log })
       const f = appendVerifyToReport(stateDir, r.text)
-      // ⭐ 2026-10-19：没有可核的记录时**别往 duty.log 里刷**（用户截图里看到同一句连了 4 行，
-      //    那是每轮 90 秒后自动核一次 + 手动点，读起来像在报错 ✗）⇒ 只在有活干的时候记日志 ✓
-      if (r.checked.length) log(`评论复核结束（${why}）：查了 ${r.checked.length} 条${f ? `，已写进 ${f}` : ''}`)
-      else log(`评论复核结束（${why}）：没有可核的记录（不算错）`)
+      log(`评论复核结束（${why}）：查了 ${r.checked.length} 条${f ? `，已写进 ${f}` : ''}`)
       return { ok: true, why, checked: r.checked, skipped: r.skipped, text: r.text, report: f || '' }
     } catch (e) {
       log(`评论复核失败（${why}）：${e?.message ?? e}`)
@@ -1158,13 +816,6 @@ function reportMeta() {
    try {
     refreshCfg()          // ⭐ 设置页刚改过的值要立刻生效（config 是就地改的，快照会过期）
     const dsh = resolveDsh()
-    // ⭐ 找不到 dsh 就别硬跑：以前会退化成裸 `dsh` ⇒ spawn 失败、只留 exit 1 + 一串乱码 ✗
-    if (dsh.missing) {
-      const msg = '这一轮没跑：找不到 dsh。' + dsh.hint
-      log(msg)
-      try { stubReportIfMissing(1) } catch { /* 补不上也不影响这句话已经进日志 */ }
-      return { started: false, why, error: msg }
-    }
     const overlay = ensureOverlay()
     const args = [...dsh.args, '--profile', cfg.headlessProfile || 'headless']
     if (overlay) args.push('--patch', overlay)
@@ -1185,35 +836,20 @@ function reportMeta() {
       //    中文 / emoji 打进管道会炸（用户反馈过 UnicodeDecodeError），一律按 UTF-8 来
       // ⭐ ELECTRON_RUN_AS_NODE：**桌面版（Electron）里 spawn 出去的 node 必须带这个**，
       //    否则它当成"再开一个 Electron 应用"、什么都不干就以 0 退出（issue #5：0.17 秒、code 0、什么都没做）
-      env: uvEnv({ BILI_DUTY_HOME: stateDir, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
+      env: pyEnv({ BILI_DUTY_HOME: stateDir, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
     })
     // ⚠️ 2026-10-16 issue #1（用户 `miaoxingyunduo` 贴了崩溃日志）：`duty.log` 被别的进程占着时
     //    (`EBUSY`) `appendFileSync` 会抛异常 —— 而这里是 **stream 的 data 回调**，没人接
     //    ⇒ **未捕获异常 ⇒ 整个 DSH 宿主被杀**（所有会话一起没）。跟 10-14 定时器那次是同一类 ✗
     //    ⇒ ⭐ 规矩：**插件里任何写日志/写文件的地方都包好 try/catch**，再错也只该"这一轮没跑成" ✓
-    // ⚠️ 2026-10-19 用户贴来的 duty.log 里有 `'dsh' 不是内部或外部命令` 的乱码 ✗ ——
-    //    cmd.exe 自己吐的错误信息是 **GBK**，我们按 UTF-8 写进日志就成了方块 ⇒ 用户看不懂
-    //    ⇒ 先按 UTF-8 解；出现替换符（\uFFFD）就回退 GBK ✓
-    const toText = (buf) => {
-      try {
-        const b = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf))
-        const u = b.toString('utf8')
-        if (!u.includes('\uFFFD')) return u
-        try { return new TextDecoder('gbk').decode(b) } catch { return u }
-      } catch { return String(buf) }
-    }
     const pick = (buf) => {
-      try { appendFileSync(logFile, toText(buf), 'utf8') } catch { /* 写不进去就丢，绝不能抛 */ }
+      try { appendFileSync(logFile, String(buf), 'utf8') } catch { /* 写不进去就丢，绝不能抛 */ }
     }
     child.stdout?.on('data', pick)
     child.stderr?.on('data', pick)
     child.on('exit', (code) => {
       log(`刷B站结束（${why}，code=${code}）`)
       stubReportIfMissing(code)   // ⭐ 没写报告就补一份占位 —— 别让使用者什么都看不到
-    // ⭐ 2026-10-20：这一轮跑成了、并且使用者选了收藏夹 ⇒ 把挑中的存进去（后台做，别拖住收尾）
-    if (code === 0 && Number(cfg.favFolderId) > 0) {
-      favToday('auto').catch((error) => log('自动收藏出错（已兜住）：' + String(error?.message ?? error)))
-    }
       rotateLogIfBig()            // ⭐ 日志别无声地长（三天 797KB ⇒ 一年约 100MB）
       // ⭐ 这一轮挑了几条：从今天的报告里数（上一轮挑的还在同一份文件里 ⇒ 数出来就是全天的账）
       try {
@@ -1273,143 +909,6 @@ function reportMeta() {
     ctx.effect(() => () => clearInterval(timer), 'bili-duty: 谷时定时器')
   } catch (e) { log(`定时器没起来：${e?.message ?? e}`) }
 
-  // ⭐ 2026-10-21 私信双向（2.0 的主角）：
-  //    宿主每 N 分钟**纯代码**查一次私信（不花 token），只有"主人本人"发来新消息时，
-  //    才 spawn 一轮很小的任务去回一句。默认关 —— 它一开就会花 token，得用户自己点头。
-  const dmSeenFile = join(stateDir, 'dm-seen.json')
-  const dmQuotaFile = join(stateDir, 'dm-quota.json')
-  const readJsonFile = (f, dflt) => { try { return JSON.parse(readFileSync(f, 'utf8')) } catch { return dflt } }
-  const writeJsonFile = (f, obj) => { try { writeFileSync(f, JSON.stringify(obj, null, 2), 'utf8') } catch { /* 写不进去就下次再说 */ } }
-  const dmOwnerUid = () => {
-    const direct = Number(cfg.dmOwnerUid) || Number(cfg.dmUid) || dmUidCache
-    if (direct > 0) return direct
-    // 2026-10-21：昵称之前查过（uid-cache.json）就直接用，不用等到"跑一轮"才有人查
-    try {
-      const cache = JSON.parse(readFileSync(join(stateDir, 'uid-cache.json'), 'utf8')) || {}
-      const name = String(cfg.mentionName || '').trim()
-      if (name && Number(cache[name]) > 0) return Number(cache[name])
-    } catch { /* 没有缓存就算了 */ }
-    return 0
-  }
-
-  function dmPromptFor(fromUid, text) {
-    const raw = String(text || '').slice(0, 600)
-    const bv = (raw.match(/BV[0-9A-Za-z]{10}/) || [])[0] || ''
-    return '这是 B站 私信里主人发来的一句话：' + JSON.stringify(raw)
-      + (bv ? `\n里面有个视频 ${bv}：用 bili_subtitle 读一下它的字幕再回，说点具体的。` : '')
-      + `\n用 bili_send_message 回他一句（uid=${Number(fromUid)}），100 字以内，像聊天。`
-  }
-
-  function runDmReply(fromUid, text) {
-    try {
-      refreshCfg()
-      const dsh = resolveDsh()
-      if (dsh.missing) { log('私信回复没跑：找不到 dsh（' + dsh.hint + '）'); return { ok: false } }
-      const overlay = ensureOverlay()
-      const args = [...dsh.args, '--profile', cfg.headlessProfile || 'headless']
-      if (overlay) args.push('--patch', overlay)
-      args.push(dmPromptFor(fromUid, text))
-      log(`私信回复开跑：来自 uid=${fromUid}`)
-      const child = spawn(dsh.command, args, {
-        cwd: stateDir, shell: dsh.shell, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-        env: uvEnv({ BILI_DUTY_HOME: stateDir, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
-      })
-      const toText = (buf) => { try { const b = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf)); const u = b.toString('utf8'); return u.includes('\uFFFD') ? (() => { try { return new TextDecoder('gbk').decode(b) } catch { return u } })() : u } catch { return String(buf) } }
-      const pick = (buf) => { try { appendFileSync(logFile, toText(buf), 'utf8') } catch { /* 丢日志也不能抛 */ } }
-      child.stdout?.on('data', pick)
-      child.stderr?.on('data', pick)
-      child.on('exit', (code) => { log(`私信回复结束（code=${code}）`); rotateLogIfBig() })
-      return { ok: true }
-    } catch (e) { log('私信回复出错：' + String(e?.message ?? e)); return { ok: false } }
-  }
-
-  let dmTimer = null
-  let dmBusy = false
-  async function dmTick() {
-    if (dmBusy) return
-    dmBusy = true
-    // ⭐ 每一跳都重新读一次配置：设置页里刚改的（开关 / 间隔 / 发给谁）下一分钟就生效，不用重启
-    try { refreshCfg() } catch { /* 读不到就沿用旧值 */ }
-    try {
-      // ⭐ 2026-10-21：同一台机器上可能有两个宿主（桌面版 + web 版）都装着这个插件，
-      //    两边都查私信 ⇒ 同一条消息可能被回两遍 ⇒ 用一个带 pid + 时间的锁，谁先跑谁干。
-      {
-        const lockFile = join(stateDir, 'dm-lock.json')
-        let lock = null
-        try { lock = JSON.parse(readFileSync(lockFile, 'utf8')) } catch { lock = null }
-        const alive = (pid) => {
-          if (!pid) return false
-          try { process.kill(pid, 0); return true } catch { return false }
-        }
-        const fresh = lock && Number(lock.ts) > Date.now() - 3 * 60_000
-        if (fresh && Number(lock.pid) !== process.pid && alive(Number(lock.pid))) {
-          log('私信监听：另一个宿主正在跑（pid=' + lock.pid + '）⇒ 这一跳让给它')
-          return
-        }
-        try { writeFileSync(lockFile, JSON.stringify({ pid: process.pid, ts: Date.now() }), 'utf8') } catch { /* 写不了就算了 */ }
-      }
-      if (!cfg.dmWatch) return
-      const cred = dmCred(stateDir)
-      if (!cred) return
-      // 拿不到就先现查一次（之后走 uid-cache.json 的缓存，不再重复请求）
-      let ownerTry = dmOwnerUid()
-      if (!ownerTry && String(cfg.mentionName || '').trim()) ownerTry = await warmDmUid()
-      if (ownerTry > 0) dmUidCache = ownerTry
-      const owner = dmOwnerUid()
-      if (!owner) { log('私信监听：还不知道回给谁（没填 UID / 没填「@ 谁」）⇒ 先监听不了'); return }
-      const sess = await dmList(cred)
-      const mine = sess.filter((s) => s.uid === owner && s.unread > 0)
-      // ⭐ 只回主人本人：别人（陌生人）发来的一律不回 —— 这里明确记一行，免得以为它在偷听
-      const others = sess.filter((s) => s.uid !== owner && s.unread > 0)
-      // 陌生人未读：只报一次（同一批 key 不重复刷日志）
-      if (others.length) {
-        const sig = others.map((s) => s.uid + ':' + s.unread).sort().join(',')
-        const seenOther = readJsonFile(join(stateDir, 'dm-others.json'), { sig: '' })
-        if (seenOther.sig !== sig) {
-          log('私信监听：有 ' + others.length + ' 个陌生人的未读私信，按规矩不回（只回主人本人）')
-          writeJsonFile(join(stateDir, 'dm-others.json'), { sig })
-        }
-      }
-      if (!mine.length) return
-      const seen = readJsonFile(dmSeenFile, {})
-      const quota = readJsonFile(dmQuotaFile, { day: '', n: 0 })
-      const today = dayKey()
-      if (quota.day !== today) { quota.day = today; quota.n = 0 }
-      for (const s of mine) {
-        const msgs = await dmFetch(cred, s.uid, 8)
-        const last = [...msgs].reverse().find((m) => !m.fromMe)
-        if (!last) continue
-        if (seen[String(s.uid)] === last.key) continue
-        seen[String(s.uid)] = last.key
-        writeJsonFile(dmSeenFile, seen)
-        if (Number(cfg.dmReplyPerDay) > 0 && quota.n >= Number(cfg.dmReplyPerDay)) { log('私信监听：今天的回复额度用完了（' + quota.n + '）⇒ 这条先不回'); continue }
-        log(`私信监听：收到新消息 —— ${last.text.slice(0, 40)}`)
-        runDmReply(s.uid, last.text)
-        quota.n++
-        writeJsonFile(dmQuotaFile, quota)
-      }
-    } catch (e) {
-      log('私信监查出错（已兜住）：' + String(e?.message ?? e))
-    } finally { dmBusy = false }
-  }
-
-  function startDmWatch() {
-    try {
-      if (dmTimer) { clearInterval(dmTimer); dmTimer = null }
-      const mins = Math.max(1, Number(cfg.dmWatchMinutes) || 1)
-      dmTimer = setInterval(() => { dmTick().catch((e) => log('私信定时器异常：' + String(e?.message ?? e))) }, mins * 60_000)
-      if (dmTimer.unref) dmTimer.unref()
-      log(`私信监听：${cfg.dmWatch ? '已开' : '关着'}（每 ${mins} 分钟查一次）`)
-    } catch (e) { log('启私信监听失败：' + String(e?.message ?? e)) }
-  }
-
-
-
-  try { MIG_200() } catch (e) { log('迁移没跑：' + String(e?.message ?? e)) }
-
-  try { startDmWatch() } catch (e) { log('私信监听没起来：' + String(e?.message ?? e)) }
-  ctx.effect(() => () => { try { if (dmTimer) clearInterval(dmTimer) } catch { /* 忽略 */ } }, 'bili-duty: 私信监听')
-
   /* ─────────────── HTTP（设置页用） ─────────────── */
 
   const sendJson = (res, code, obj) => {
@@ -1430,6 +929,22 @@ function reportMeta() {
   const venvPython = () => process.platform === 'win32'
     ? join(stateDir, '.venv', 'Scripts', 'python.exe')
     : join(stateDir, '.venv', 'bin', 'python')
+
+  /**
+   * 运行 MCP / 画二维码时实际使用的 Python。
+   *
+   * 2026-10-22 实测：DSH 设置层可能把 pythonPath 覆盖成字符串 "python"，
+   * 而真正的依赖装在插件家目录的 .venv 里；结果 venvReady=true，但 MCP 用系统
+   * Python 启动直接 ModuleNotFoundError: No module named 'mcp'。
+   * 配置是具体路径且存在时尊重配置；只是 "python"/空/不存在时回退到插件 venv。
+   */
+  const effectivePython = () => {
+    const configured = String(cfg.pythonPath || '').trim()
+    if (configured && configured !== 'python' && existsSync(configured)) return configured
+    const venv = venvPython()
+    if (existsSync(venv)) return venv
+    return configured || 'python'
+  }
 
   /**
    * 建 venv + 装依赖 —— ⭐ **起完就返回，不等它装完**。
@@ -1473,7 +988,7 @@ function reportMeta() {
   const spawnLogged = (cmd, args) => new Promise((resolve) => {
     appendInstall(`\n$ ${cmd} ${args.join(' ')}\n`)
     let c
-    try { c = spawn(cmd, args, { cwd: stateDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: uvEnv() }) }
+    try { c = spawn(cmd, args, { cwd: stateDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: pyEnv() }) }
     catch (e) { appendInstall(`起不来：${e?.message ?? e}\n`); return resolve(1) }
     const w = (b) => appendInstall(String(b))
     c.stdout?.on('data', w)
@@ -1518,123 +1033,10 @@ function reportMeta() {
   const digestDir = join(stateDir, 'digest')
   try { mkdirSync(digestDir, { recursive: true }) } catch { /* 建不了也别拦着插件加载 */ }
 
-  /* ─────────────── 自动收藏（宿主侧完成，模型拿不到这只手）─────────────── */
-  /**
-   * ⭐ 2026-10-20（思路来自社区 PR #63 / HebPRo，自己实现）：把这一轮挑中的视频存进使用者自己的收藏夹。
-   *   为什么放宿主而不给模型一只工具：① 收藏是"写动作"，给模型等于多一只可能被误用的手；
-   *   ② 挑中哪几条宿主自己就能从报告里数出来（行首的「### BV号」），不必再花 token 问模型。
-   */
-  const favOps = (args) => new Promise((resolve) => {
-    try {
-      const py = String(cfg.pythonPath || 'python')
-      const child = spawn(py, [join(stateDir, 'favops.py'), ...args], {
-        cwd: stateDir, env: pyEnv(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
-      })
-      let outTxt = '', errTxt = ''
-      const timer = setTimeout(() => { try { child.kill() } catch { /* 已退出 */ } resolve({ ok: false, error: 'favops 超时（30 秒）' }) }, 30_000)
-      child.stdout?.on('data', (c) => { outTxt += c })
-      child.stderr?.on('data', (c) => { errTxt += c })
-      child.on('error', (error) => { clearTimeout(timer); resolve({ ok: false, error: String(error?.message ?? error) }) })
-      child.on('exit', () => {
-        clearTimeout(timer)
-        try { resolve(JSON.parse(String(outTxt).trim().split('\n').pop() || '{}')) } catch { resolve({ ok: false, error: (errTxt || outTxt || 'favops 没有输出').slice(-300) }) }
-      })
-    } catch (error) { resolve({ ok: false, error: String(error?.message ?? error) }) }
-  })
-
-  /** 从今天的报告里抠出"挑中的" BV 号（只认行首的 ### BV… 标题行；代码围栏里的不算） */
-  const pickIdsFromReport = (file) => {
-    try {
-      const fence = new RegExp('```[\s\S]*?```', 'g')
-      const text = readFileSync(file, 'utf8').replace(fence, '')
-      return [...new Set([...text.matchAll(/^#{2,3}[ \t]*(BV[0-9A-Za-z]{10})/gm)].map((m) => m[1]))]
-    } catch { return [] }
-  }
-
-  let favBusy = false
-  const favToday = async (why = 'manual') => {
-    if (favBusy) return { ok: false, error: '上一次收藏还没跑完，等它完事' }
-    favBusy = true
-    try {
-      refreshCfg()
-      const fid = Math.max(0, Math.floor(Number(cfg.favFolderId) || 0))
-      if (fid <= 0) return { ok: false, error: '还没选收藏夹（设置页「自动收藏到」选一个）' }
-      if (!hasCredential()) return { ok: false, error: '还没扫码登录 B站' }
-      const script = join(stateDir, 'favops.py')
-      if (!existsSync(script)) return { ok: false, error: 'favops.py 不在家里（重启一次 dsh 会自动铺好）' }
-      const report = join(outDir, `${dayKey()}.md`)
-      const ids = pickIdsFromReport(report)
-      if (!ids.length) return { ok: false, error: '今天的报告里没有挑中的视频（行首 ### BV号 那些）' }
-      const failures = []
-      let added = 0
-      for (const bv of ids) {
-        const r = await favOps(['add', bv, String(fid)])
-        if (r && r.ok) added++
-        else failures.push(bv + ': ' + ((r && r.error) || '未知原因'))
-      }
-      log(`自动收藏（${why}）：${added}/${ids.length} 条` + (failures.length ? '，失败 ' + failures.length : ''))
-      if (failures.length) log('  收藏失败明细：' + failures.slice(0, 5).join(' | '))
-      return { ok: true, added, total: ids.length, failures }
-    } finally { favBusy = false }
-  }
-
   /**
    * ⭐ 日志轮转（2026-10-16 量出来的：`duty.log` 三天就 797 KB、没有轮转 ⇒ 一年约 100 MB ✗）
    * 超过 2MB 就滚成 `duty.log.1`（只留一份），别让它在 C 盘上无声地长。
    */
-  /* ─────────────── 「它刷过的视频」：数据层 + 封面代理 ─────────────── */
-  /** seen.md 的表格一行一条：`| 日期 | bvid | 标题 | UP | 状态 |`（跳过的也记，理由写在状态里） */
-  const parseSeenTable = () => {
-    const file = join(stateDir, 'seen.md')
-    let text = ''
-    try { text = readFileSync(file, 'utf8') } catch { return [] }
-    const out = []
-    const seen = new Set()
-    for (const raw of text.split(/\r?\n/)) {
-      const line = raw.trim()
-      if (!line.startsWith('|')) continue
-      const cells = line.split('|').map((s) => s.trim())
-      // 去掉首尾空段：["", 日期, bvid, 标题, UP, 状态, ""]
-      const c = cells.slice(1, cells.length - 1)
-      if (c.length < 5) continue
-      const [day, bvid, title, up, status] = c
-      if (!/^BV[0-9A-Za-z]{10}$/.test(bvid)) continue          // 表头 / 分隔线 / 别的表格都跳过
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue
-      const key = bvid + '@' + day
-      if (seen.has(key)) continue                              // 同一天重复记的只留第一条
-      seen.add(key)
-      const picked = status.includes('挑了')
-      const commented = status.includes('评论')
-    const delivered = /评论|私信|已发/.test(status)   // 2026-10-21：2.0 起默认私信投递 ⇒ 「发过」不再只等于「评论过」
-      out.push({ day, bvid, title, up, status, picked, commented, delivered, url: 'https://www.bilibili.com/video/' + bvid })
-    }
-    out.sort((a, b) => (a.day === b.day ? (a.picked === b.picked ? 0 : a.picked ? -1 : 1) : (a.day < b.day ? 1 : -1)))
-    return out
-  }
-
-  /** 封面代理：浏览器不能直连 i0.hdslb.com（防盗链 403 + 等于把用户 IP 交出去）⇒ 宿主取回来再转发 */
-  const coverFor = async (bv) => {
-    if (!/^BV[0-9A-Za-z]{10}$/.test(bv)) return null
-    try {
-      const r = await fetch('https://api.bilibili.com/x/web-interface/view?bvid=' + bv, {
-        signal: AbortSignal.timeout(8000),
-        headers: { 'user-agent': 'Mozilla/5.0', referer: 'https://www.bilibili.com/' },
-      })
-      if (!r.ok) return null
-      const j = await r.json()
-      const pic = String(j && j.data && j.data.pic || '')
-      if (!pic) return null
-      const img = await fetch(pic, {
-        signal: AbortSignal.timeout(10000),
-        headers: { 'user-agent': 'Mozilla/5.0', referer: 'https://www.bilibili.com/' },
-      })
-      if (!img.ok) return null
-      const buf = Buffer.from(await img.arrayBuffer())
-      const type = img.headers.get('content-type') || 'image/jpeg'
-      return { buf, type }
-    } catch (error) { log('取封面失败：' + String(error && error.message || error)); return null }
-  }
-
   const rotateLogIfBig = (limit = 2 * 1024 * 1024) => {
     try {
       if (!existsSync(logFile) || statSync(logFile).size < limit) return
@@ -1663,7 +1065,7 @@ function reportMeta() {
     let c
     try {
       c = spawn(cmd, args, { cwd: stateDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-        env: uvEnv(env || {}) })
+        env: pyEnv(env || {}) })
     } catch (e) { sink(`起不来：${e?.message ?? e}\n`); return resolve(1) }
     const w = (b) => sink(String(b))
     c.stdout?.on('data', w)
@@ -1685,26 +1087,11 @@ function reportMeta() {
         const uvCmd = await resolveUv()
         if (!existsSync(py)) {
           // --seed：把 pip 也装进去（uv 默认不给）—— 不然出现问题时连 pip 都没有，没法补救 ✗
-          if (uvCmd) {
-    // ⭐ 2026-10-19（社区 PR #37 / issue #15）：uv 不给 --python 时拿"最新 CPython"，而 av / ctranslate2 / aiohttp
-    //    在 3.14+ 没有 wheel ⇒ 转写依赖直接 ResolutionImpossible ✗ ⇒ 先钉 3.12，失败再退回默认
-    const spec = String(process.env.BILI_DUTY_VENV_PYTHON || '3.12').trim()
-    let vc = await spawnTo(uvCmd, ['venv', '--seed', '--python', spec, asrDir], { sink: appendAsr })
-    if (vc !== 0) {
-      appendAsr(`\n（uv 带 --python ${spec} 没成 —— 退回 uv 默认 Python，能不能装上看运气）\n`)
-      vc = await spawnTo(uvCmd, ['venv', '--seed', asrDir], { sink: appendAsr })
-    }
-  }
+          if (uvCmd) await spawnTo(uvCmd, ['venv', '--seed', asrDir], { sink: appendAsr })
           else await spawnTo(String(cfg.pythonPath || 'python'), ['-m', 'venv', asrDir], { sink: appendAsr })
         }
         if (!existsSync(py)) {
-          // ⭐ 2026-10-19（用户 `天文星球` 的截图）：uv 报 `Could not acquire lock … uv\cache\.lock 拒绝访问 (os error 5)`
-          //    以前这句话只会说"先点上面的装依赖" ✗ —— 用户根本不知道该动哪儿 ✓
-          //    ⇒ 现在把两条真实出路写出来（0.1.11 起 uv 缓存已经改到插件家，正常不会再撞）
-          appendAsr('建环境失败 —— 可能有两种原因：\n')
-          appendAsr('  ① 上面日志里出现 "Could not acquire lock / uv\\cache\\.lock / 拒绝访问" ⇒ 是 uv 缓存目录没权限；\n')
-          appendAsr('     装新版（0.1.11+）会把缓存改到插件自己的家目录，就不会再碰 %LOCALAPPDATA%\\uv 了。\n')
-          appendAsr('  ② 机器上没有可用的 uv 或 Python ⇒ 先点上面的「装依赖」，把主依赖装好再来。\n')
+          appendAsr('建环境失败 —— 先点上面的「装依赖」，把 uv 或 Python 准备好\n')
           log('转写：建环境失败'); return
         }
         appendAsr('装 faster-whisper + yt-dlp（走国内镜像）…\n')
@@ -1712,16 +1099,8 @@ function reportMeta() {
         // ⚠️ av 必须钉在 17 以下：faster-whisper 1.2.1 会调 av.open(metadata_errors=…)，
         //    而 av 17+ 不再接受这个参数 ⇒ 装了最新的 av 反而转不了（2026-10-14 在主人机器上实证）
         const AV_PIN = process.env.BILI_DUTY_AV_PIN || 'av>=12,<17'
-        // ⭐ 2026-10-19（issue #27）：以前只走一个镜像，撞上清华 403 就整轮失败 ✗
-        //    改成跟主环境一样轮换三个镜像；每个镜像先 uv pip、失败再退回 python -m pip ✓
-        const mirrors = [mirror, 'https://mirrors.ustc.edu.cn/pypi/simple', 'https://mirrors.aliyun.com/pypi/simple']
-        const PKGS = ['faster-whisper', 'yt-dlp', AV_PIN]
-        for (const m of mirrors) {
-          if (code === 0) break
-          appendAsr(`\n—— 镜像：${m}\n`)
-          if (uvCmd) code = await spawnTo(uvCmd, ['pip', 'install', '--python', py, '-i', m, ...PKGS], { sink: appendAsr })
-          if (code !== 0) code = await spawnTo(py, ['-m', 'pip', 'install', '-i', m, ...PKGS], { sink: appendAsr })
-        }
+        if (uvCmd) code = await spawnTo(uvCmd, ['pip', 'install', '--python', py, '-i', mirror, 'faster-whisper', 'yt-dlp', AV_PIN], { sink: appendAsr })
+        if (code !== 0) code = await spawnTo(py, ['-m', 'pip', 'install', '-i', mirror, 'faster-whisper', 'yt-dlp', AV_PIN], { sink: appendAsr })
         if (code !== 0) { appendAsr('装包失败 —— 看上面的报错\n'); log('转写：装包失败'); return }
         // ⭐ 顺手把模型也下好（不然第一次跑那一轮会卡在下载上 ✗）；模型走 HuggingFace 国内镜像
         const model = String(cfg.asrModel || 'small')
@@ -1762,15 +1141,7 @@ function reportMeta() {
         if (!existsSync(venvPy)) {
           // ⭐ 2026-10-17（issue #8③）：ASR 那个环境带了 --seed，主环境却漏了 ⇒ uv 建的 venv 默认不含 pip，
           //    一旦镜像失败、回退 `python -m pip` 就是 `No module named pip` ⇒ 连补救的路都没有 ✗
-          if (uvCmd) {
-    const spec = String(process.env.BILI_DUTY_VENV_PYTHON || '3.12').trim()
-    let code = await spawnLogged(uvCmd, ['venv', '--seed', '--python', spec, join(stateDir, '.venv')])
-    if (code !== 0) {
-      appendInstall(`\n（uv 带 --python ${spec} 没成 —— 退回 uv 默认 Python）\n`)
-      code = await spawnLogged(uvCmd, ['venv', '--seed', join(stateDir, '.venv')])
-    }
-    if (code !== 0) log('建 venv 没成功（两条路都试过）')
-  }
+          if (uvCmd) await spawnLogged(uvCmd, ['venv', '--seed', join(stateDir, '.venv')])
           if (!existsSync(venvPy) && !uvCmd) await spawnLogged(py, ['-m', 'venv', join(stateDir, '.venv')])
         }
         let code = 1
@@ -1784,17 +1155,11 @@ function reportMeta() {
           if (code !== 0) code = await spawnLogged(venvPy, ['-m', 'pip', 'install', '-i', m, '-r', reqFile])
         }
         if (code === 0 && existsSync(venvPy)) {
-          // ⚠️ 光写 config.json 不够：DSH 原生设置里那份旧值（"python"）会在 loadCfg 时压回来
-          //    （已由 loadCfg 的 HOST_WINS_EXCLUDED 解决 ✓）；这里再把宿主的同步结果说清楚，
-          //    免得以后再出现"日志说设好了、实际没生效" ✗
-          const r = await persistCfg({ pythonPath: venvPy })
-          appendInstall(`已把 pythonPath 设为 ${venvPy}（DSH 那边${r?.host?.ok ? '已同步' : '没写成：' + (r?.host?.error || '未知原因')}）\n`)
+          await persistCfg({ pythonPath: venvPy })   // ⭐ 不然设置页里显式设过 pythonPath 的话，这里就白写了
+          appendInstall(`已把 pythonPath 设为 ${venvPy}\n`)
         }
-        {
-          const miss = missingVenvDeps()
-          appendInstall(`=== 结束（exit ${code}，venvReady=${venvReadyNow()}${miss.length ? '，缺：' + miss.join(' / ') : ''}）===\n`)
-          log(`装依赖结束：exit=${code} venvReady=${venvReadyNow()}${miss.length ? ' 缺：' + miss.join(',') : ''}`)
-        }
+        appendInstall(`=== 结束（exit ${code}，venvReady=${venvReadyNow()}）===\n`)
+        log(`装依赖结束：exit=${code} venvReady=${existsSync(venvPy)}`)
       } catch (e) {
         appendInstall(`装依赖崩了：${e?.stack ?? e}\n`)
         log(`装依赖崩了：${e?.message ?? e}`)
@@ -1843,20 +1208,6 @@ function reportMeta() {
       loggedIn: hasCredential(),
       venvReady: venvReadyNow(),
       version: myVersion(),
-      dmUidResolved: Number(cfg.dmUid) || dmUidCache || 0,
-      // ⭐ 人设：老用户（只填过工作区）可以一键导入他那份 AGENTS.md
-      personaFromWs: (() => {
-        if (String(cfg.personaPrompt || '').trim()) return ''
-        const ws = String(cfg.workspace || '').trim()
-        if (!ws) return ''
-        const f = join(ws, 'AGENTS.md')
-        try { return existsSync(f) ? readFileSync(f, 'utf8').slice(0, 4000) : '' } catch { return '' }
-      })(),
-      // 2026-10-18：这几项"本地存了、但没能同步到 DSH 原生设置" ⇒ 设置页要告诉用户
-      // （DSH 0.2.1 某些启动方式会拒写：profile reload requires the root Include entry）
-      notSynced: Object.keys(readOverride()),
-      // ⭐ 2026-10-19：把"这一轮会用哪个 dsh"显示出来 —— 桌面版排查全靠它（空字符串 = 没找到）
-      dshCli: dshCliCached(),
       installFailed: !installing && !venvReadyNow() && (() => { try { return readFileSync(installLogFile, 'utf8').length > 0 } catch { return false } })(),
       installing,
       // ── 本地转写那一套的状态（设置页要显示进度）──
@@ -1877,47 +1228,8 @@ function reportMeta() {
   const handle = async (req, res, url) => {
     refreshCfg()
     const path = url.pathname
-    // ⭐ 2026-10-21：每条视频一份笔记 —— **宿主拆报告**，不让模型多写一个字（零 token、不会写错）
-    const notesDir = join(stateDir, 'reports')
-    let notesSig = ''
-    function syncNotes() {
-      try {
-        const file = join(outDir, dayKey() + '.md')
-        if (!existsSync(file)) return 0
-        const mtime = statSync(file).mtimeMs
-        const sig = file + '@' + mtime
-        if (sig === notesSig) return 0
-        const text = readFileSync(file, 'utf8')
-        const blocks = text.split(/\n(?=###\s*BV)/).filter((b) => /^###\s*BV/.test(b.trim()))
-        if (!blocks.length) { notesSig = sig; return 0 }
-        mkdirSync(notesDir, { recursive: true })
-        let n = 0
-        for (const b of blocks) {
-          const m = /^###\s*(BV[0-9A-Za-z]+)/.exec(b.trim())
-          if (!m) continue
-          const bvid = m[1]
-          const title = (/\*\*标题\*\*\s*[：:]\s*(.+)/.exec(b) || [])[1] || bvid
-          const day = dayKey()
-          const out = join(notesDir, bvid + '-' + day + '.md')
-          if (existsSync(out)) continue
-          const head = '# ' + title + '\n\n'
-            + '> 来自「刷B站」' + day + ' 的那一轮 · ' + bvid
-            + ' · https://www.bilibili.com/video/' + bvid + '\n'
-            + '> 这一份是**单条笔记**（整天的日报在 ' + file + '）\n\n---\n\n'
-          writeFileSync(out, head + b.replace(/^###\s*BV[0-9A-Za-z]+/, '').trim() + '\n', 'utf8')
-          n++
-        }
-        notesSig = sig
-        if (n > 0) log('单条笔记：新写了 ' + n + ' 份到 ' + notesDir)
-        return n
-      } catch (e) { log('拆单条笔记失败：' + String(e?.message ?? e)); return 0 }
-    }
+    if (req.method === 'GET' && path === '/api/bili-duty/status') return sendJson(res, 200, status())
 
-
-    if (req.method === 'GET' && path === '/api/bili-duty/status') {
-      try { syncNotes() } catch (e) { /* 笔记失败不影响状态接口 */ }
-      return sendJson(res, 200, status())
-    }
     if (req.method === 'GET' && path === '/api/bili-duty/config') {
       return sendJson(res, 200, { ok: true, config: cfg, windows: WINDOWS, home: stateDir })
     }
@@ -1940,7 +1252,6 @@ function reportMeta() {
     }
 
     if (req.method === 'POST' && path === '/api/bili-duty/run') {
-      if (cfg.dmMode !== 'off' && !(Number(cfg.dmUid) > 0)) await warmDmUid()
       return sendJson(res, 200, { ok: true, ...runDuty('manual') })
     }
 
@@ -1952,44 +1263,7 @@ function reportMeta() {
     // 装"本地转写"那套（独立环境：faster-whisper + yt-dlp + Whisper 模型）
     if (req.method === 'POST' && path === '/api/bili-duty/install-asr') {
       return sendJson(res, 200, runAsrInstall())
-
     }
-
-      // 收藏夹列表（设置页下拉用）
-      if (req.method === 'GET' && path === '/api/bili-duty/fav-folders') {
-        const r = await favOps(['folders'])
-        return sendJson(res, 200, r && r.ok ? { ok: true, folders: r.folders || [] } : { ok: false, error: (r && r.error) || '读不到收藏夹' })
-      }
-      // 补收藏今天挑中的（设置页按钮）
-      if (req.method === 'POST' && path === '/api/bili-duty/fav-today') return sendJson(res, 200, await favToday('manual'))
-
-      // 「它刷过的视频」：从 seen.md 读出来（数据按天倒序，跳过的也在，理由在 status 里）
-      if (req.method === 'GET' && path === '/api/bili-duty/watched') {
-          try { syncNotes() } catch (e) { /* 同上 */ }
-        const all = parseSeenTable()
-        const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit')) || 60))
-        const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0)
-        const meta = reportMeta()
-          const notes = (() => { try { return new Set(readdirSync(notesDir).map((f) => f.split('-')[0])) } catch { return new Set() } })()
-        const allRows = all.map((x) => { const m = meta.get(x.bvid) || {}; return { ...x, tier: m.tier || '', why: m.why || '', note: notes.has(x.bvid) } })
-        const onlyPicked = url.searchParams.get('picked') === '1'
-        const tier = String(url.searchParams.get('tier') || '')
-        const state = String(url.searchParams.get('state') || '')   // picked | skipped | commented
-        let rows = onlyPicked ? allRows.filter((x) => x.picked) : allRows
-        if (tier) rows = rows.filter((x) => x.tier === tier)
-        if (state === 'picked') rows = rows.filter((x) => x.picked)
-        if (state === 'skipped') rows = rows.filter((x) => !x.picked)
-    if (state === 'commented') rows = rows.filter((x) => x.delivered || x.commented)
-        return sendJson(res, 200, { ok: true, total: rows.length, offset, limit, rows: rows.slice(offset, offset + limit) })
-      }
-      // 封面（宿主代理），浏览器只跟本机说话
-      if (req.method === 'GET' && path === '/api/bili-duty/cover') {
-        const got = await coverFor(String(url.searchParams.get('bv') || ''))
-        if (!got) { res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' }); res.end('no cover'); return }
-        res.writeHead(200, { 'content-type': got.type, 'cache-control': 'max-age=86400' })
-        res.end(got.buf)
-        return
-      }
 
     // ⭐ 「复核评论」：拿判重表里最近的记录，去 B站 核一遍到底公开可见没有
     //    （设置页那个按钮、以及每轮结束 90 秒后自动跑一次，都走这里）
@@ -2008,22 +1282,7 @@ function reportMeta() {
     // 「打开文件夹」：浏览器开不了本地目录 ⇒ 让宿主去开（只认 out / home 两个，别的不受理）
     if (req.method === 'POST' && path === '/api/bili-duty/open') {
       const body = await readBody(req)
-      const what = String(body?.what || 'out')
-      // ⭐ 2026-10-21：**打开一个网页**（桌面版里 <a target=_blank> 不一定交给系统浏览器 ⇒ 改成让宿主 shell 打开）
-      if (what === 'url') {
-        const u = String(body?.u || '')
-        const onlyHttp = /^https?:\/\//i.test(u)
-        if (!onlyHttp) return sendJson(res, 200, { ok: false, error: '只接受 http(s) 链接' })
-        if (process.platform !== 'win32') {
-          const opener = process.platform === 'darwin' ? 'open' : 'xdg-open'
-          spawn(opener, [u], { detached: true, stdio: 'ignore' }).on('error', () => {})
-          return sendJson(res, 200, { ok: true })
-        }
-        spawn('cmd.exe', ['/c', 'start', '', u], { detached: true, stdio: 'ignore' }).on('error', () => {})
-        log('打开网页：' + u)
-        return sendJson(res, 200, { ok: true })
-      }
-      const dir = what === 'home' ? stateDir : outDir
+      const dir = String(body?.what || 'out') === 'home' ? stateDir : outDir
       if (process.platform !== 'win32') return sendJson(res, 200, { ok: false, error: '这个按钮目前只做了 Windows' })
       // ⭐ 三种方式依次试（PATH 不全时 explorer.exe 会找不到 ✗；spawn 的失败是**异步**的，
       //    try/catch 抓不到 ⇒ 必须挂 'error' 监听，否则会升级成未捕获异常）
@@ -2054,150 +1313,41 @@ function reportMeta() {
     if (req.method === 'POST' && path === '/api/bili-duty/upgrade') return sendJson(res, 200, runUpgrade())
 
     // 「检查更新」：⚠️ 只在用户点按钮时才联网（不偷偷发请求 ✓），结果缓存一天 ✓
-    // ⭐ 2026-10-19（主人："现在自动更新能让扫 github 吗"）：**两条源都问** ——
-    //    npm 上可能还没发上去（账号被暂停时会停在旧版），那时候 GitHub 才是最新 ✓
-    //    ⇒ 谁给的版本号更新就用谁，并记住来源：一键升级按来源选 `add dsh-bili-scroll` / `add github:…` ✓
     if (req.method === 'GET' && path === '/api/bili-duty/update') {
-      const out = { ok: true, current: myVersion(), latest: '', hasNew: false, source: 'npm', page: 'https://www.npmjs.com/package/dsh-bili-scroll' }
+      const out = { ok: true, current: myVersion(), latest: '', hasNew: false, page: 'https://www.npmjs.com/package/dsh-bili-scroll' }
+      try {
+        if (updateCache && Date.now() - updateCache.at < 24 * 3600 * 1000) out.latest = updateCache.latest
+        else {
+          const ctrl = new AbortController()
+          const timer = setTimeout(() => ctrl.abort(), 8000)
+          const r = await fetch('https://registry.npmjs.org/dsh-bili-scroll/latest', { signal: ctrl.signal })
+          clearTimeout(timer)
+          const j = await r.json()
+          out.latest = String(j.version || '')
+          updateCache = { at: Date.now(), latest: out.latest }
+        }
+      } catch (e) { out.ok = false; out.error = String(e?.message ?? e); return sendJson(res, 200, out) }
       // ⭐ 要比谁更新，不能只比不相等 —— 否则本地版本高于 npm 时会误报有新版
-      // ⭐ 2026-10-20：预发布标签要单独看 —— 以前只比三段数字 ⇒ `0.2.0-rc.1` 被当成 [0,2,0]，
-      //    跟正式版打平、却比 0.1.18 更大 ⇒ 用户会被提示"升级到 rc 版" ✗；现在数字段相同时**正式版 > 预发布版**
-      const vnum = (v) => String(v || '').trim().replace(/^v/i, '').split('-')[0].split('.').map((x) => parseInt(x, 10) || 0)
-      const isPre = (v) => /-/.test(String(v || '').trim())
+      const vnum = (v) => String(v || '').split('.').map((x) => parseInt(x, 10) || 0)
       const cmp = (a, b) => {
         const x = vnum(a), y = vnum(b)
         for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0) }
-        const pa = isPre(a), pb = isPre(b)
-        if (pa === pb) return 0
-        return pa ? -1 : 1   // 有预发布标签的更旧
+        return 0
       }
-      const fresh = (c) => Boolean(c) && Date.now() - c.at < 24 * 3600 * 1000
-      // ① npm（不依赖加速器，通常最快）
-      let npmVer = ''
-      try {
-        if (fresh(updateCache)) npmVer = updateCache.latest
-        else {
-          const r = await fetch('https://registry.npmjs.org/dsh-bili-scroll/latest', { signal: AbortSignal.timeout(8000) })
-          const j = await r.json()
-          npmVer = String(j.version || '')
-          updateCache = { at: Date.now(), latest: npmVer }
-        }
-      } catch (e) { log('查 npm 版本没成功（接着查 GitHub）：' + (e?.message ?? e)) }
-      // ② GitHub（要加速器；不通就安静跳过，别打扰用户）
-      let ghVer = ''
-      try {
-        if (fresh(ghUpdateCache)) ghVer = ghUpdateCache.latest
-        else {
-          const r = await fetch('https://api.github.com/repos/c1overzz/dsh-bili-scroll/contents/package.json', {
-            signal: AbortSignal.timeout(6000),
-            headers: { 'user-agent': 'dsh-bili-scroll', accept: 'application/vnd.github+json' },
-          })
-          if (r.ok) {
-            const j = await r.json()
-            const txt = Buffer.from(String(j.content || ''), 'base64').toString('utf8')
-            ghVer = String(JSON.parse(txt).version || '')
-            ghUpdateCache = { at: Date.now(), latest: ghVer }
-          }
-        }
-      } catch { /* 没有加速器时这里基本都失败 —— 静默，别打扰 */ }
-      // 谁新用谁；一样新时优先 npm（装起来快）
-      if (ghVer && (!npmVer || cmp(ghVer, npmVer) > 0)) { out.latest = ghVer; out.source = 'github' }
-      else out.latest = npmVer || ghVer
-      if (out.source === 'github') out.page = 'https://github.com/c1overzz/dsh-bili-scroll'
       out.hasNew = Boolean(out.latest) && cmp(out.latest, out.current) > 0
-      lastUpdateSource = out.source
-      if (!out.latest) { out.ok = false; out.error = '两条源都没查到版本号（网络可能不通）' }
       return sendJson(res, 200, out)
     }
 
     // 「测一下」：真跑一次，回答"能不能用"
-    // ⭐ 2026-10-21：把"要日志"变成"点一下" —— 诊断信息（纯文本，可整段复制）
-    function diagnoseText() {
-      const tail = (() => {
-        try { const p = join(stateDir, 'duty.log'); return existsSync(p) ? readFileSync(p, 'utf8').slice(-6000) : '（没有 duty.log）' }
-        catch (e) { return '（日志读不到：' + String(e?.message ?? e) + '）' }
-      })()
-      const free = (() => { try { const s = statSync ? null : null; return '' } catch { return '' } })()
-      const masked = (() => {
-        const c = { ...cfg }
-        for (const k of ['dmUid']) c[k] = c[k] ? '(已填)' : ''
-        return JSON.stringify(c, null, 2)
-      })()
-      return [
-        '=== 刷B站 诊断信息 ===',
-        '版本：' + myVersion(),
-        '平台：' + process.platform + ' ' + process.arch + ' · node ' + process.versions.node + (process.versions.electron ? ' · electron ' + process.versions.electron : ''),
-        'dsh：' + (() => { try { const d = resolveDsh(); return d.missing ? '没找到（' + d.hint + '）' : d.command + ' ' + d.args.join(' ') } catch (e) { return '探测失败：' + e?.message } })(),
-        'headless profile：' + (cfg.headlessProfile || 'headless'),
-        'pythonPath：' + cfg.pythonPath,
-        'venv 就绪：' + (venvReadyNow() ? '是' : '否') + (missingVenvDeps().length ? '（缺：' + missingVenvDeps().join(' / ') + '）' : ''),
-        '转写环境：' + (existsSync(join(stateDir, '.venv-asr')) ? '在' : '没装'),
-        'B站 登录：' + (hasCredential() ? '有凭证' : '没有凭证'),
-        '投递方式：' + (cfg.dmMode || 'off') + (Number(cfg.dmUid) > 0 ? '（UID 已填 ' + cfg.dmUid + '）' : '（UID 没填，会用昵称查）'),
-        '自动评论：' + (cfg.autoComment ? '开' : '关') + ' · 回复评论：' + (cfg.replyToComments ? '开' : '关'),
-        '家目录：' + stateDir,
-        '今天的报告：' + join(outDir, dayKey() + '.md'),
-        '',
-        '--- 配置（已脱敏）---',
-        masked,
-        '',
-        '--- duty.log 末尾 ---',
-        tail,
-      ].join('\n')
-    }
-
-    // ⭐ 环境自检：一条一条给结论 + 怎么办
-    async function selfCheck() {
-      const items = []
-      const put = (name, ok, detail, fix) => items.push({ name, ok, detail: detail || '', fix: ok ? '' : (fix || '') })
-      // ① dsh
-      try { const d = resolveDsh(); put('能找到 dsh（跑一轮要用）', !d.missing, d.missing ? '没找到：' + d.hint : (d.command + ' ' + (d.args || []).join(' ')), '在设置页「dsh 路径」里填上 …/@deepseek-ai/dsh/lib/bin.js') }
-      catch (e) { put('能找到 dsh（跑一轮要用）', false, String(e?.message ?? e), '同上') }
-      // ② Python
-      put('Python 主依赖装好了', venvReadyNow(), missingVenvDeps().length ? '缺：' + missingVenvDeps().join(' / ') : '就绪', '点「重装主依赖」，等它跑完再看这里')
-      // ③ 凭证
-      put('B站 已登录', hasCredential(), hasCredential() ? '家目录里有凭证文件' : '还没有凭证', '点「扫码登录」，手机确认时选「记住我 / 长期」')
-      // ④ 家目录可写
-      let writable = true
-      try { const t = join(stateDir, '.diag-write-test'); writeFileSync(t, 'x'); rmSync(t) } catch { writable = false }
-      put('家目录可写（报告要写在这儿）', writable, writable ? stateDir : '写不进去', '检查杀软是否拦了这个目录，或把家目录换到别的盘')
-      // ⑤ 能不能连上 B站
-      let reach = false
-      let reachDetail = ''
-      try {
-        const r = await fetch('https://api.bilibili.com/x/web-interface/nav', { headers: { 'User-Agent': 'Mozilla/5.0' } })
-        reach = r.ok
-        reachDetail = 'HTTP ' + r.status
-      } catch (e) { reachDetail = String(e?.message ?? e) }
-      put('能连上 B站', reach, reachDetail, '检查网络 / 加速器；公司或校园网可能拦了')
-      // ⑥ 私信对象
-      const dmOk = cfg.dmMode === 'off'
-        ? true
-        : (Number(cfg.dmUid) > 0 || String(cfg.mentionName || '').trim() !== '' || dmUidCache > 0)
-      put('知道私信发给谁（或没开私信）', dmOk,
-        cfg.dmMode === 'off' ? '当前是「只发评论」' : (Number(cfg.dmUid) > 0 ? 'UID ' + cfg.dmUid : (dmUidCache > 0 ? '按昵称查到 ' + dmUidCache : '还没查到')),
-        '填「私信发给谁（UID）」，或填「要 @ 谁」的昵称让它自己查')
-      return { ok: items.every((x) => x.ok), items }
-    }
-
     if (req.method === 'POST' && path === '/api/bili-duty/check') {
       return sendJson(res, 200, await checkUp())
     }
 
-    // 「复制诊断信息」
-    if (req.method === 'GET' && path === '/api/bili-duty/diagnose') {
-      return sendJson(res, 200, { ok: true, text: diagnoseText() })
-    }
-
-    // 「环境自检」
-    if (req.method === 'GET' && path === '/api/bili-duty/selfcheck') {
-      return sendJson(res, 200, await selfCheck())
-    }
-
     // ── 扫码登录（设置页用）──
     if (req.method === 'POST' && path === '/api/bili-duty/login/start') {
+      refreshCfg()
       const { key, url } = await loginStart()
-      const png = await renderQrPng(cfg.pythonPath, stateDir, url)
+      const png = await renderQrPng(effectivePython(), stateDir, url)
       let qr = null
       if (png) { try { qr = 'data:image/png;base64,' + readFileSync(png).toString('base64') } catch { qr = null } }
       log(`出码：${url}${qr ? '（已画成 PNG）' : '（没画出 PNG —— venv 里大概还没有 qrcode）'}`)
@@ -2231,5 +1381,5 @@ function reportMeta() {
   } catch (e) { log(`HTTP 路由没挂上：${e?.message ?? e}`) }
 
   ctx.effect(() => () => { try { mcp?.stop() } catch { /* 收摊 */ } }, 'bili-duty: 收 MCP 子进程')
-  log(`已挂载（家=${stateDir}，python=${cfg.pythonPath}，峰谷=${cfg.peakValley ? '开' : '关'}）`)
+  log(`已挂载（家=${stateDir}，python=${effectivePython()}，峰谷=${cfg.peakValley ? '开' : '关'}）`)
 }
